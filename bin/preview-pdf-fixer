@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  preview-pdf-fixer [options] input.pdf [input2.pdf ...]
+  preview-pdf-fixer [options] figure.svg
+
+Fix PDFs/SVGs that render incorrectly in macOS Preview/Safari. PDF inputs are
+rewritten with Ghostscript; the default mode flattens transparency to PDF 1.3,
+which is the safest option for Figma exports embedded through LaTeX/pdfTeX.
+SVG inputs in flatten mode are rasterized into PDF pages to avoid reintroducing
+soft masks.
+
+Options:
+  -o, --output FILE     Output file. Only valid with one input.
+  --out-dir DIR         Write outputs to DIR instead of beside each input.
+  --suffix TEXT         Output suffix before .pdf (default: _preview)
+  --mode flatten        Preview-safe PDF 1.3 flattening (default)
+  --mode rewrite        Smaller PDF 1.4 rewrite; less aggressive
+  --svg-scale N         Raster scale for SVG flatten mode (default: 1)
+  -h, --help            Show this help
+
+Examples:
+  preview-pdf-fixer paper.pdf
+  preview-pdf-fixer -o paper_preview.pdf paper.pdf
+  preview-pdf-fixer --out-dir fixed figures/*.pdf
+  preview-pdf-fixer --svg-scale 2 --out-dir fixed figures/*.svg
+  preview-pdf-fixer --mode rewrite -o paper_rewrite.pdf paper.pdf
+USAGE
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+lower_ext() {
+  local name=${1##*/}
+  local ext=${name##*.}
+  printf '%s' "$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')"
+}
+
+default_output_for() {
+  local input=$1
+  local base dir stem
+
+  base=$(basename "$input")
+  stem=${base%.*}
+  if [[ -n "$out_dir" ]]; then
+    mkdir -p "$out_dir"
+    printf '%s/%s%s.pdf' "$out_dir" "$stem" "$suffix"
+  else
+    dir=$(dirname "$input")
+    printf '%s/%s%s.pdf' "$dir" "$stem" "$suffix"
+  fi
+}
+
+validate_svg_scale() {
+  python3 - "$svg_scale" <<'PY' >/dev/null
+import sys
+
+try:
+    scale = float(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+if scale <= 0:
+    raise SystemExit(1)
+PY
+}
+
+svg_to_vector_pdf() {
+  local input=$1
+  local output=$2
+
+  if command -v rsvg-convert >/dev/null 2>&1; then
+    rsvg-convert -f pdf -o "$output" "$input"
+  elif command -v inkscape >/dev/null 2>&1; then
+    inkscape "$input" --export-type=pdf --export-filename="$output"
+  else
+    die "SVG rewrite mode needs rsvg-convert or inkscape"
+  fi
+}
+
+svg_to_raster_pdf() {
+  local input=$1
+  local output=$2
+  local png=$3
+  local dpi
+
+  need_cmd rsvg-convert
+  need_cmd python3
+  validate_svg_scale || die "--svg-scale must be a positive number"
+
+  dpi=$(python3 - "$svg_scale" <<'PY'
+import sys
+print(96 * float(sys.argv[1]))
+PY
+)
+
+  rsvg-convert -f png -z "$svg_scale" -b white -o "$png" "$input"
+  python3 - "$png" "$output" "$dpi" <<'PY'
+from PIL import Image
+import sys
+
+png, output, dpi = sys.argv[1], sys.argv[2], float(sys.argv[3])
+img = Image.open(png)
+if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+    rgba = img.convert("RGBA")
+    bg = Image.new("RGB", rgba.size, "white")
+    bg.paste(rgba, mask=rgba.getchannel("A"))
+    img = bg
+else:
+    img = img.convert("RGB")
+img.save(output, "PDF", resolution=dpi, quality=95)
+PY
+}
+
+fix_pdf() {
+  local input=$1
+  local output=$2
+  local compat
+  local tmp_output
+
+  need_cmd gs
+
+  case "$mode" in
+    flatten) compat=1.3 ;;
+    rewrite) compat=1.4 ;;
+    *) die "unknown mode: $mode" ;;
+  esac
+
+  tmp_output="$tmp_dir/$(basename "$output").tmp.pdf"
+
+  gs \
+    -dSAFER \
+    -dBATCH \
+    -dNOPAUSE \
+    -q \
+    -sDEVICE=pdfwrite \
+    -dCompatibilityLevel="$compat" \
+    -dPrinted=false \
+    -dDetectDuplicateImages=true \
+    -dCompressFonts=true \
+    -dSubsetFonts=true \
+    -dDownsampleColorImages=false \
+    -dDownsampleGrayImages=false \
+    -dDownsampleMonoImages=false \
+    -sColorConversionStrategy=RGB \
+    -dProcessColorModel=/DeviceRGB \
+    -sOutputFile="$tmp_output" \
+    "$input"
+
+  mv "$tmp_output" "$output"
+}
+
+mode=flatten
+out_file=
+out_dir=
+suffix=_preview
+svg_scale=1
+inputs=()
+
+while (($#)); do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -o|--output)
+      [[ $# -ge 2 ]] || die "--output requires a file"
+      out_file=$2
+      shift 2
+      ;;
+    --out-dir)
+      [[ $# -ge 2 ]] || die "--out-dir requires a directory"
+      out_dir=$2
+      shift 2
+      ;;
+    --suffix)
+      [[ $# -ge 2 ]] || die "--suffix requires text"
+      suffix=$2
+      shift 2
+      ;;
+    --mode)
+      [[ $# -ge 2 ]] || die "--mode requires flatten or rewrite"
+      mode=$2
+      shift 2
+      ;;
+    --svg-scale)
+      [[ $# -ge 2 ]] || die "--svg-scale requires a positive number"
+      svg_scale=$2
+      shift 2
+      ;;
+    --)
+      shift
+      inputs+=("$@")
+      break
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      inputs+=("$1")
+      shift
+      ;;
+  esac
+done
+
+[[ ${#inputs[@]} -gt 0 ]] || { usage >&2; exit 1; }
+[[ -z "$out_file" || ${#inputs[@]} -eq 1 ]] || die "--output can only be used with one input"
+[[ -z "$out_file" || -z "$out_dir" ]] || die "--output and --out-dir are mutually exclusive"
+[[ "$mode" == "flatten" || "$mode" == "rewrite" ]] || die "--mode must be flatten or rewrite"
+
+tmp_dir=$(mktemp -d)
+trap 'rm -rf "$tmp_dir"' EXIT
+
+for input in "${inputs[@]}"; do
+  [[ -f "$input" ]] || die "not a file: $input"
+
+  ext=$(lower_ext "$input")
+  output=${out_file:-$(default_output_for "$input")}
+  mkdir -p "$(dirname "$output")"
+
+  if [[ "$ext" == "pdf" ]]; then
+    fix_pdf "$input" "$output"
+  elif [[ "$ext" == "svg" ]]; then
+    tmp_output="$tmp_dir/$(basename "$output").tmp.pdf"
+    if [[ "$mode" == "flatten" ]]; then
+      tmp_png="$tmp_dir/$(basename "${input%.*}").png"
+      svg_to_raster_pdf "$input" "$tmp_output" "$tmp_png"
+    else
+      svg_to_vector_pdf "$input" "$tmp_output"
+    fi
+    mv "$tmp_output" "$output"
+  else
+    die "unsupported input type .$ext for $input"
+  fi
+
+  printf 'wrote %s\n' "$output"
+done

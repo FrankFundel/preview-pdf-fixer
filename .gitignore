@@ -1,0 +1,9 @@
+.DS_Store
+*.tmp
+*.tmp.pdf
+*_preview.pdf
+fixed/
+dist/
+build/
+.venv/
+__pycache__/
