@@ -19,6 +19,7 @@ Options:
   --suffix TEXT         Output suffix before .pdf (default: _preview)
   --mode flatten        Preview-safe PDF 1.3 flattening (default)
   --mode rewrite        Smaller PDF 1.4 rewrite; less aggressive
+  --no-preserve-links   Do not restore original PDF link annotations
   --svg-scale N         Raster scale for SVG flatten mode (default: 1)
   -h, --help            Show this help
 
@@ -125,6 +126,7 @@ fix_pdf() {
   local input=$1
   local output=$2
   local compat
+  local visual_output
   local tmp_output
 
   need_cmd gs
@@ -135,6 +137,7 @@ fix_pdf() {
     *) die "unknown mode: $mode" ;;
   esac
 
+  visual_output="$tmp_dir/$(basename "$output").visual.pdf"
   tmp_output="$tmp_dir/$(basename "$output").tmp.pdf"
 
   gs \
@@ -153,15 +156,265 @@ fix_pdf() {
     -dDownsampleMonoImages=false \
     -sColorConversionStrategy=RGB \
     -dProcessColorModel=/DeviceRGB \
-    -sOutputFile="$tmp_output" \
+    -sOutputFile="$visual_output" \
     "$input"
 
+  if [[ "$preserve_links" == true ]]; then
+    restore_pdf_links "$input" "$visual_output" "$tmp_output"
+  else
+    mv "$visual_output" "$tmp_output"
+  fi
+
   mv "$tmp_output" "$output"
+}
+
+restore_pdf_links() {
+  local original=$1
+  local visual=$2
+  local output=$3
+
+  need_cmd python3
+
+  python3 - "$original" "$visual" "$output" <<'PY'
+import copy
+import sys
+
+try:
+    from PyPDF2 import PdfReader, PdfWriter
+    from PyPDF2.generic import (
+        ArrayObject,
+        DictionaryObject,
+        FloatObject,
+        NameObject,
+        NullObject,
+        NumberObject,
+        TextStringObject,
+        create_string_object,
+    )
+except ImportError:
+    raise SystemExit(
+        "PyPDF2 is required to preserve PDF links. Install it with "
+        "`python3 -m pip install PyPDF2`, or rerun with --no-preserve-links."
+    )
+
+original_path, visual_path, output_path = sys.argv[1:4]
+
+try:
+    original = PdfReader(original_path)
+    visual = PdfReader(visual_path)
+except Exception as exc:
+    raise SystemExit(f"could not read PDF while restoring links: {exc}")
+
+if len(original.pages) != len(visual.pages):
+    raise SystemExit(
+        "cannot preserve links: original and fixed PDFs have different page counts"
+    )
+
+writer = PdfWriter()
+for page in visual.pages:
+    writer.add_page(page)
+
+
+def pdf_number(value):
+    if value is None or isinstance(value, NullObject):
+        return NullObject()
+    if isinstance(value, int):
+        return NumberObject(value)
+    return FloatObject(value)
+
+
+def page_index_for_destination(destination):
+    try:
+        return original.get_destination_page_number(destination)
+    except Exception:
+        page = destination.get("/Page") if hasattr(destination, "get") else None
+        if page is not None:
+            try:
+                return original.get_page_number(page.get_object())
+            except Exception:
+                pass
+    return None
+
+
+def destination_to_array(destination):
+    page_index = page_index_for_destination(destination)
+    if page_index is None or not 0 <= page_index < len(writer.pages):
+        return None
+
+    fit = str(destination.get("/Type", "/Fit"))
+    out = ArrayObject([writer.pages[page_index].indirect_reference, NameObject(fit)])
+
+    if fit == "/XYZ":
+        out.extend(
+            [
+                pdf_number(destination.get("/Left")),
+                pdf_number(destination.get("/Top")),
+                pdf_number(destination.get("/Zoom")),
+            ]
+        )
+    elif fit in ("/FitH", "/FitBH"):
+        out.append(pdf_number(destination.get("/Top")))
+    elif fit in ("/FitV", "/FitBV"):
+        out.append(pdf_number(destination.get("/Left")))
+    elif fit == "/FitR":
+        out.extend(
+            [
+                pdf_number(destination.get("/Left")),
+                pdf_number(destination.get("/Bottom")),
+                pdf_number(destination.get("/Right")),
+                pdf_number(destination.get("/Top")),
+            ]
+        )
+
+    return out
+
+
+def array_destination_to_array(destination):
+    if not destination:
+        return None
+
+    target = destination[0]
+    page_index = None
+    try:
+        page_index = original.get_page_number(target.get_object())
+    except Exception:
+        try:
+            page_index = int(target)
+        except Exception:
+            pass
+
+    if page_index is None or not 0 <= page_index < len(writer.pages):
+        return None
+
+    out = ArrayObject([writer.pages[page_index].indirect_reference])
+    for item in destination[1:]:
+        out.append(clone_simple(item))
+    return out
+
+
+def resolve_destination(value):
+    value = value.get_object() if hasattr(value, "get_object") else value
+
+    if isinstance(value, (str, TextStringObject)):
+        destination = original.named_destinations.get(str(value))
+        return destination_to_array(destination) if destination else None
+
+    if isinstance(value, NameObject):
+        name = str(value)
+        destination = original.named_destinations.get(name[1:]) or original.named_destinations.get(name)
+        return destination_to_array(destination) if destination else None
+
+    if isinstance(value, ArrayObject):
+        return array_destination_to_array(value)
+
+    if isinstance(value, DictionaryObject):
+        return destination_to_array(value)
+
+    return None
+
+
+def clone_simple(obj):
+    obj = obj.get_object() if hasattr(obj, "get_object") else obj
+
+    if isinstance(obj, DictionaryObject):
+        out = DictionaryObject()
+        for key, value in obj.items():
+            out[NameObject(str(key))] = clone_simple(value)
+        return out
+
+    if isinstance(obj, ArrayObject):
+        return ArrayObject([clone_simple(value) for value in obj])
+
+    if isinstance(obj, NameObject):
+        return NameObject(str(obj))
+
+    if isinstance(obj, (TextStringObject, str)):
+        return create_string_object(str(obj))
+
+    if isinstance(obj, NullObject) or obj is None:
+        return NullObject()
+
+    if isinstance(obj, int):
+        return NumberObject(obj)
+
+    if isinstance(obj, float):
+        return FloatObject(obj)
+
+    try:
+        return copy.copy(obj)
+    except Exception:
+        return obj
+
+
+def clone_link_annotation(annotation_ref):
+    annotation = annotation_ref.get_object()
+    if annotation.get("/Subtype") != "/Link":
+        return None
+
+    out = DictionaryObject()
+    for key in ("/Type", "/Subtype", "/Rect", "/Border", "/C", "/H", "/F", "/BS", "/Contents"):
+        if key in annotation:
+            out[NameObject(key)] = clone_simple(annotation[key])
+
+    if "/A" in annotation:
+        action = annotation["/A"].get_object()
+        subtype = action.get("/S")
+
+        if subtype == "/URI" and "/URI" in action:
+            out[NameObject("/A")] = DictionaryObject(
+                {
+                    NameObject("/S"): NameObject("/URI"),
+                    NameObject("/Type"): NameObject("/Action"),
+                    NameObject("/URI"): clone_simple(action["/URI"]),
+                }
+            )
+        elif subtype == "/GoTo" and "/D" in action:
+            destination = resolve_destination(action["/D"])
+            if destination is None:
+                return None
+            out[NameObject("/Dest")] = destination
+        else:
+            out[NameObject("/A")] = clone_simple(action)
+    elif "/Dest" in annotation:
+        destination = resolve_destination(annotation["/Dest"])
+        if destination is None:
+            return None
+        out[NameObject("/Dest")] = destination
+    else:
+        return None
+
+    return out
+
+
+restored = 0
+for page_index, (original_page, output_page) in enumerate(zip(original.pages, writer.pages)):
+    if "/Annots" in output_page:
+        del output_page["/Annots"]
+
+    annotations = original_page.get("/Annots")
+    if not annotations:
+        continue
+
+    output_page[NameObject("/Annots")] = ArrayObject()
+    for annotation_ref in annotations:
+        cloned = clone_link_annotation(annotation_ref)
+        if cloned is None:
+            continue
+        cloned[NameObject("/P")] = output_page.indirect_reference
+        output_page["/Annots"].append(writer._add_object(cloned))
+        restored += 1
+
+with open(output_path, "wb") as output_file:
+    writer.write(output_file)
+
+print(f"restored {restored} link annotations", file=sys.stderr)
+PY
 }
 
 mode=flatten
 out_file=
 out_dir=
+preserve_links=true
 suffix=_preview
 svg_scale=1
 inputs=()
@@ -191,6 +444,10 @@ while (($#)); do
       [[ $# -ge 2 ]] || die "--mode requires flatten or rewrite"
       mode=$2
       shift 2
+      ;;
+    --no-preserve-links)
+      preserve_links=false
+      shift
       ;;
     --svg-scale)
       [[ $# -ge 2 ]] || die "--svg-scale requires a positive number"

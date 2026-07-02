@@ -32,6 +32,8 @@ The safest fix is to flatten transparency.
 
 For PDF input, the default mode uses Ghostscript `pdfwrite` to create a PDF 1.3 file. PDF 1.3 predates live transparency, so Ghostscript resolves the masks and transparency into normal page content. Text and many vector elements usually remain vector, while fragile transparent parts become renderer-friendly.
 
+After Ghostscript rewrites the visual content, `preview-pdf-fixer` restores the original link annotations with PyPDF2. This matters for LaTeX papers: Ghostscript may otherwise drop or rewrite some clickable references, especially URL annotations on pages that get heavily rasterized.
+
 For SVG input, the default mode rasterizes the SVG into a PDF page. This is intentionally blunt: complex SVG filters can turn back into the same soft-mask mess if converted as vector PDF. Rasterizing makes the output robust before LaTeX ever sees it.
 
 There is also a `rewrite` mode that keeps modern PDF transparency and is smaller, but it is less bulletproof for Preview.
@@ -57,6 +59,8 @@ Or call the script directly:
 For PDF input:
 
 - Ghostscript (`gs`)
+- Python 3
+- PyPDF2
 
 For SVG input in default `flatten` mode:
 
@@ -72,7 +76,7 @@ On macOS with Homebrew:
 
 ```bash
 brew install ghostscript librsvg
-python3 -m pip install Pillow
+python3 -m pip install PyPDF2 Pillow
 ```
 
 ## Usage
@@ -105,6 +109,12 @@ Try the smaller, less aggressive rewrite mode:
 
 ```bash
 preview-pdf-fixer --mode rewrite -o paper_rewrite.pdf paper.pdf
+```
+
+Skip link restoration if you only care about visual output:
+
+```bash
+preview-pdf-fixer --no-preserve-links -o paper_visual_only.pdf paper.pdf
 ```
 
 By default, an input named `paper.pdf` produces `paper_preview.pdf` beside it.
@@ -151,6 +161,7 @@ Passing `qpdf --check` does not mean Preview will render the file correctly. It 
 - `flatten` is the safest mode for Apple Preview/Safari.
 - `flatten` can make PDFs larger.
 - Some transparent/vector regions may become image-like internally.
+- PDF link annotations are restored by default, but unusual annotation types may not be preserved.
 - `rewrite` keeps files smaller and more editable, but may leave soft masks that Preview can still mishandle.
 - SVG `flatten` is rasterized by design. Use `--svg-scale 2` or higher for print-quality figure PDFs.
 
